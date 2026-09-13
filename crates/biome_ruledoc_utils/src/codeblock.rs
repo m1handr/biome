@@ -57,13 +57,7 @@ pub enum OptionsParsingMode {
 }
 
 impl CodeBlock {
-    pub fn create_analyzer_options<L>(
-        &self,
-        config: Option<Configuration>,
-    ) -> Result<AnalyzerOptions>
-    where
-        L: ServiceLanguage,
-    {
+    pub fn create_settings(&self, config: Option<Configuration>) -> Result<Settings> {
         let mut settings = Settings::default();
 
         if self.use_options {
@@ -77,6 +71,17 @@ impl CodeBlock {
             settings.merge_with_configuration(config, None, vec![])?;
         }
 
+        Ok(settings)
+    }
+
+    pub fn create_analyzer_options<L>(
+        &self,
+        config: Option<Configuration>,
+    ) -> Result<AnalyzerOptions>
+    where
+        L: ServiceLanguage,
+    {
+        let settings = self.create_settings(config)?;
         let path = BiomePath::new(self.file_path());
 
         Ok(settings
@@ -138,7 +143,12 @@ impl FromStr for CodeBlock {
                         }
                         code_block.file_path = Some(normalize_file_path(path));
                     } else {
-                        if DocumentFileSource::from_extension(token, false)
+                        let tag = match token {
+                            "javascript" => "js",
+                            "typescript" => "ts",
+                            _ => token,
+                        };
+                        if DocumentFileSource::from_extension(tag, false)
                             == DocumentFileSource::Unknown
                         {
                             bail!("Unrecognised attribute in code block: {token}");
@@ -152,7 +162,7 @@ impl FromStr for CodeBlock {
                             );
                         }
 
-                        code_block.tag = token.to_string();
+                        code_block.tag = tag.to_string();
                     }
                 }
             }

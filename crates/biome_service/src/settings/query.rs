@@ -98,7 +98,7 @@ struct InlineSettingsQuery {
 
 #[derive(Clone)]
 pub(crate) struct SettingsQuery {
-    project: ProjectInput,
+    project: Option<ProjectInput>,
     selection: SettingsQuerySelection,
     inline: Option<InlineSettingsQuery>,
 }
@@ -130,14 +130,27 @@ impl SettingsQuery {
             settings: SettingsIdentity::from(Arc::new(settings)),
         });
         Self {
-            project,
+            project: Some(project),
             selection,
             inline,
         }
     }
 
+    pub(crate) fn ephemeral(project_settings: &Settings, file_path: &Utf8Path) -> Self {
+        let selection = SettingsQuerySelection {
+            selection: SettingsSelectionKey::Root,
+            override_indices: project_settings.matching_override_indices(file_path),
+        };
+        Self {
+            project: None,
+            selection,
+            inline: None,
+        }
+    }
+
     pub(crate) fn project(&self) -> ProjectInput {
         self.project
+            .expect("ProjectInput is not available in ephemeral queries")
     }
 
     pub(crate) fn selection(&self) -> &SettingsQuerySelection {

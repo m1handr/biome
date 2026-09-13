@@ -244,3 +244,97 @@ fn html_non_style_attribute_is_not_parsed_as_css() {
         r#"<div data-style="color: rgb("></div>"#,
     );
 }
+
+#[test]
+fn embedded_html_preserves_inline_settings() {
+    let file = "/project/component.html";
+    let content = r#"<script>class A { constructor(@dec x) {} }</script>"#;
+    let fs = MemoryFileSystem::default();
+    fs.insert(Utf8PathBuf::from(file), content);
+
+    let (workspace, project_key) = setup_workspace_and_open_project(fs, "/");
+
+    workspace
+        .update_settings(UpdateSettingsParams {
+            project_key,
+            workspace_directory: None,
+            configuration: Configuration {
+                html: Some(HtmlConfiguration {
+                    experimental_full_support_enabled: Some(true.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            extended_configurations: vec![],
+            module_graph_resolution_kind: ModuleGraphResolutionKind::None,
+        })
+        .unwrap();
+
+    workspace
+        .open_file(OpenFileParams {
+            project_key,
+            path: BiomePath::new(file),
+            content: FileContent::FromServer,
+            document_file_source: None,
+            persist_node_cache: false,
+            inline_config: None,
+            editor_features: None,
+        })
+        .unwrap();
+
+    let diagnostics = workspace.db_get_parse_diagnostics(Utf8Path::new(file));
+    assert!(
+        !diagnostics.is_empty(),
+        "Expected parse error without unsafe parameter decorators enabled"
+    );
+
+    let inline_file = "/project/component_inline.html";
+    let inline_fs = MemoryFileSystem::default();
+    inline_fs.insert(Utf8PathBuf::from(inline_file), content);
+    let (workspace, project_key) = setup_workspace_and_open_project(inline_fs, "/");
+
+    workspace
+        .update_settings(UpdateSettingsParams {
+            project_key,
+            workspace_directory: None,
+            configuration: Configuration {
+                html: Some(HtmlConfiguration {
+                    experimental_full_support_enabled: Some(true.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            extended_configurations: vec![],
+            module_graph_resolution_kind: ModuleGraphResolutionKind::None,
+        })
+        .unwrap();
+
+    let inline_config = Configuration {
+        javascript: Some(biome_configuration::javascript::JsConfiguration {
+            parser: Some(biome_configuration::javascript::JsParserConfiguration {
+                unsafe_parameter_decorators_enabled: Some(true.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    workspace
+        .open_file(OpenFileParams {
+            project_key,
+            path: BiomePath::new(inline_file),
+            content: FileContent::FromServer,
+            document_file_source: None,
+            persist_node_cache: false,
+            inline_config: Some(inline_config),
+            editor_features: None,
+        })
+        .unwrap();
+
+    let diagnostics = workspace.db_get_parse_diagnostics(Utf8Path::new(inline_file));
+    assert!(
+        diagnostics.is_empty(),
+        "Expected no parse error when unsafe parameter decorators are enabled via inline_config, got: {diagnostics:#?}"
+    );
+}

@@ -38,6 +38,8 @@ use crate::embed::EmbedContent;
 pub use crate::file_handlers::astro::AstroFileHandler;
 #[cfg(feature = "lang_graphql")]
 use crate::file_handlers::graphql::GraphqlFileHandler;
+#[cfg(feature = "lang_html")]
+pub use crate::file_handlers::html::parse_html_embedded_nodes;
 use crate::file_handlers::ignore::IgnoreFileHandler;
 #[cfg(all(feature = "lang_js", feature = "lang_html"))]
 pub use crate::file_handlers::svelte::SvelteFileHandler;
@@ -436,7 +438,7 @@ pub struct ParseResult {
 }
 
 #[derive(Default)]
-pub struct ParseEmbedResult {
+pub(crate) struct ParseEmbedResult {
     pub(crate) nodes: Vec<(AnyParse, EmbedContent, DocumentFileSource)>,
 }
 

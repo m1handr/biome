@@ -6,6 +6,7 @@ use biome_css_analyze::CssAnalyzerServices;
 use biome_css_parser::CssParserOptions;
 use biome_css_syntax::CssLanguage;
 use biome_diagnostics::DiagnosticExt;
+use biome_fs::BiomePath;
 use biome_graphql_syntax::GraphqlLanguage;
 use biome_html_parser::HtmlParserOptions;
 use biome_html_syntax::HtmlLanguage;
@@ -20,7 +21,8 @@ use biome_languages::{
 };
 use biome_markdown_parser::MarkdownParserOptions;
 use biome_markdown_syntax::MarkdownLanguage;
-use biome_rowan::Language;
+use biome_rowan::{Language, NodeCache};
+use biome_service::file_handlers::parse_html_embedded_nodes;
 use camino::Utf8PathBuf;
 use std::slice;
 
@@ -68,6 +70,79 @@ pub fn analyze_rule_code(analyzer: RuleCodeAnalyzer) -> Result<()> {
         enabled_rules: Some(slice::from_ref(&rule_filter)),
         ..AnalysisFilter::default()
     };
+    let html_file_source = if rule_language != "html" {
+        if let Some(explicit_path) = code_block.explicit_file_path() {
+            camino::Utf8Path::new(explicit_path)
+                .extension()
+                .and_then(|ext| HtmlFileSource::try_from_extension(ext).ok())
+        } else {
+            HtmlFileSource::try_from_extension(&code_block.tag).ok()
+        }
+    } else {
+        None
+    };
+
+    if let Some(html_file_source) = html_file_source {
+        let parse = biome_html_parser::parse_html(code, HtmlParserOptions::from(&html_file_source));
+
+        if parse.has_errors() {
+            for diagnostic in parse.into_diagnostics() {
+                writer.write_parse_error(
+                    diagnostic
+                        .with_file_path(&file_path)
+                        .with_file_source_code(code),
+                )?;
+            }
+        } else {
+            let mut node_cache = NodeCache::default();
+            let biome_path = BiomePath::new(&file_path);
+            let document_file_source = DocumentFileSource::Html(html_file_source);
+            let settings = code_block.create_settings(configuration.clone())?;
+            let any_parse = parse.into();
+            let embedded = parse_html_embedded_nodes(
+                &any_parse,
+                &biome_path,
+                &document_file_source,
+                &settings,
+                &mut node_cache,
+            );
+
+            for (any_parse, doc_source) in embedded {
+                if let DocumentFileSource::Js(file_source) = doc_source {
+                    if any_parse.has_errors() {
+                        for diagnostic in any_parse.into_diagnostics() {
+                            writer.write_parse_error(
+                                diagnostic
+                                    .with_file_path(&file_path)
+                                    .with_file_source_code(code),
+                            )?;
+                        }
+                    } else {
+                        let root = any_parse.tree();
+                        let options = code_block
+                            .create_analyzer_options::<JsLanguage>(configuration.clone())?;
+                        let services = services_builder.build_for_js_any_parse(
+                            Utf8PathBuf::from(&file_path),
+                            any_parse,
+                            file_source,
+                        );
+                        let result = biome_js_analyze::analyze(
+                            &root,
+                            filter,
+                            &options,
+                            &[],
+                            services,
+                            |signal| process_signal(signal, code, &file_path, writer),
+                        );
+                        propagate_break(result)?;
+                    }
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
     let document_file_source = if rule_language == "html" {
         DocumentFileSource::Html(
             HtmlFileSource::try_from_extension(&code_block.tag)
@@ -335,5 +410,472 @@ mod tests {
         let diagnostic = biome_test_utils::diagnostic_to_string("/bar.js", code, diagnostic);
         assert!(diagnostic.contains("has no export named missing"));
         assert!(!diagnostic.contains("module not found"));
+    }
+
+    #[test]
+    fn analyzes_astro_template_expression_for_js_rule() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "{show && <img src=\"avatar.png\" />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        let diagnostic = writer.all_diagnostics.pop().expect("useAltText diagnostic");
+        let diagnostic =
+            biome_test_utils::diagnostic_to_string("code-block.astro", code, diagnostic);
+        assert!(diagnostic.contains("Provide a text alternative"));
+    }
+
+    #[test]
+    fn analyzes_valid_astro_template_expression_for_js_rule() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro").expect("valid code block");
+        let code = "{show && <img src=\"avatar.png\" alt=\"avatar\" />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert!(writer.all_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn analyzes_astro_jsx_nested_expression() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "{items.map(item => <img src={item} />)}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic =
+            biome_test_utils::diagnostic_to_string("code-block.astro", code, diagnostic);
+        assert!(diagnostic.contains("Provide a text alternative"));
+    }
+
+    #[test]
+    fn analyzes_multiple_embedded_expressions() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code =
+            "---\nconst raw = 'avatar.png';\n---\n<h1>{raw}</h1>\n{show && <img src={raw} />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic =
+            biome_test_utils::diagnostic_to_string("code-block.astro", code, diagnostic);
+        assert!(diagnostic.contains("Provide a text alternative"));
+    }
+
+    #[test]
+    fn analyzes_astro_markup() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "<div class=\"wrapper\">\n  {<img src=\"avatar.png\" />}\n</div>";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic =
+            biome_test_utils::diagnostic_to_string("code-block.astro", code, diagnostic);
+        assert!(diagnostic.contains("Provide a text alternative"));
+    }
+
+    #[test]
+    fn analyzes_plain_jsx() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("jsx expect_diagnostic").expect("valid code block");
+        let code = "var element = <span />;";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "suspicious",
+            rule: "noVar",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic = biome_test_utils::diagnostic_to_string("code-block.jsx", code, diagnostic);
+        assert!(diagnostic.contains("Use let or const instead of var"));
+    }
+
+    #[test]
+    fn analyzes_tsx() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("tsx expect_diagnostic").expect("valid code block");
+        let code = "var element: JSX.Element = <span />;";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "suspicious",
+            rule: "noVar",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic = biome_test_utils::diagnostic_to_string("code-block.tsx", code, diagnostic);
+        assert!(diagnostic.contains("Use let or const instead of var"));
+    }
+
+    #[test]
+    fn precedence_tag_javascript_explicit_file_astro() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("javascript file=component.astro expect_diagnostic")
+            .expect("valid code block");
+        let code = "{show && <img src=\"avatar.png\" />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic =
+            biome_test_utils::diagnostic_to_string("component.astro", code, diagnostic);
+        assert!(diagnostic.contains("Provide a text alternative"));
+    }
+
+    #[test]
+    fn precedence_tag_astro_explicit_file_js() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro file=component.js expect_diagnostic")
+            .expect("valid code block");
+        let code = "var x = 1;";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "suspicious",
+            rule: "noVar",
+            rule_language: "js",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic = biome_test_utils::diagnostic_to_string("component.js", code, diagnostic);
+        assert!(diagnostic.contains("Use let or const instead of var"));
+    }
+
+    #[test]
+    fn precedence_regular_astro_tag_without_explicit_file() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "{show && <img src=\"avatar.png\" />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn precedence_regular_jsx_tag_without_explicit_file() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("jsx expect_diagnostic").expect("valid code block");
+        let code = "var x = 1;";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "suspicious",
+            rule: "noVar",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn analyzes_code_block_options() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block =
+            CodeBlock::from_str("astro use_options expect_diagnostic").expect("valid code block");
+        let code = "{show && <img src=\"avatar.png\" />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+        let config = biome_configuration::Configuration::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: Some(config),
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn reports_invalid_syntax_cases() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro").expect("valid code block");
+        let code = "{for (;;;}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert!(writer.has_parse_error);
+    }
+
+    #[test]
+    fn verifies_diagnostic_ranges_and_offsets() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "{show && <img src=\"avatar.png\" />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        let diagnostic = writer
+            .all_diagnostics
+            .pop()
+            .expect("diagnostic should be emitted");
+        let span = diagnostic.location().span.expect("span should be present");
+        let highlighted = &code[span];
+        assert!(highlighted.contains("<img"));
+        let printed = biome_test_utils::diagnostic_to_string("code-block.astro", code, diagnostic);
+        assert!(printed.contains("Provide a text alternative"));
+    }
+
+    #[test]
+    fn analyzes_plain_js() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("js expect_diagnostic").expect("valid code block");
+        let code = "var x = 1;";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "suspicious",
+            rule: "noVar",
+            rule_language: "js",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic = biome_test_utils::diagnostic_to_string("code-block.js", code, diagnostic);
+        assert!(diagnostic.contains("Use let or const instead of var"));
+    }
+
+    #[test]
+    fn analyzes_another_js_rule_on_astro_frontmatter() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "---\nvar greeting = 'hello';\n---\n<h1>{greeting}</h1>";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "suspicious",
+            rule: "noVar",
+            rule_language: "js",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic =
+            biome_test_utils::diagnostic_to_string("code-block.astro", code, diagnostic);
+        assert!(diagnostic.contains("Use let or const instead of var"));
+    }
+
+    #[test]
+    fn analyzes_another_jsx_rule_on_astro_template() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "{<img src=\"avatar.png\" />}";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "a11y",
+            rule: "useAltText",
+            rule_language: "jsx",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        let diagnostic = writer.all_diagnostics.pop().unwrap();
+        let diagnostic =
+            biome_test_utils::diagnostic_to_string("code-block.astro", code, diagnostic);
+        assert!(diagnostic.contains("Provide a text alternative"));
+    }
+
+    #[test]
+    fn verifies_autofix_ranges_on_embedded_code() {
+        let mut services_builder = AnalyzerServicesBuilder::from_files(HashMap::new(), false);
+        let code_block = CodeBlock::from_str("astro expect_diagnostic").expect("valid code block");
+        let code = "---\nvar x = 1;\n---\n";
+        let mut writer = DiagnosticConsoleWriter::default();
+
+        RuleCodeAnalyzer {
+            group: "suspicious",
+            rule: "noVar",
+            rule_language: "js",
+            code_block: &code_block,
+            code,
+            configuration: None,
+            services_builder: &mut services_builder,
+            writer: &mut writer,
+        }
+        .analyze()
+        .unwrap();
+
+        assert_eq!(writer.all_diagnostics.len(), 1);
+        assert_eq!(writer.action_count, 1);
     }
 }

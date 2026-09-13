@@ -719,6 +719,42 @@ fn parse_embedded_nodes(_params: ParseEmbeddedParams) -> ParseEmbedResult {
     ParseEmbedResult::default()
 }
 
+/// Public facade for extracting embedded nodes from an HTML parse tree.
+///
+/// Hides internal types (`ParseEmbeddedParams`, `EmbedContent`, `ParseEmbedResult`, etc.)
+/// and adapts the `Settings` reference for tooling outside `biome_service` (such as `biome_ruledoc_utils`).
+pub fn parse_html_embedded_nodes(
+    any_parse: &AnyParse,
+    path: &BiomePath,
+    file_source: &DocumentFileSource,
+    settings: &Settings,
+    node_cache: &mut NodeCache,
+) -> Vec<(AnyParse, DocumentFileSource)> {
+    #[cfg(feature = "html_embeds")]
+    {
+        let query = crate::settings::SettingsQuery::ephemeral(settings, path.as_path());
+        let editor_state = crate::settings::SettingsEditorState::new(query);
+        let settings_handle = crate::settings::SettingsHandle::new(settings, editor_state);
+        let result = parse_embedded_nodes(super::ParseEmbeddedParams {
+            any_parse,
+            path,
+            file_source,
+            settings: &settings_handle,
+            node_cache,
+        });
+        result
+            .nodes
+            .into_iter()
+            .map(|(parse, _, source)| (parse, source))
+            .collect()
+    }
+    #[cfg(not(feature = "html_embeds"))]
+    {
+        let _ = (any_parse, path, file_source, settings, node_cache);
+        Vec::new()
+    }
+}
+
 /// Result of parsing a matched embed.
 #[cfg(feature = "html_embeds")]
 struct ParsedEmbed {

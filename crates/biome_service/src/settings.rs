@@ -552,6 +552,20 @@ impl Settings {
             !feature_includes_files.is_file_included(path)
         }
     }
+
+    pub fn parse_options<L>(
+        &self,
+        path: &BiomePath,
+        file_source: &DocumentFileSource,
+    ) -> L::ParserOptions
+    where
+        L: ServiceLanguage,
+    {
+        let overrides = &self.override_settings;
+        let language_settings = &L::lookup_settings(&self.languages).parser;
+
+        L::resolve_parse_options(overrides, language_settings, path, file_source)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -722,11 +736,8 @@ impl<'a> SettingsHandle<'a, SettingsEditorState> {
     where
         L: ServiceLanguage,
     {
-        let settings = self.effective_settings();
-        let overrides = &settings.override_settings;
-        let language_settings = &L::lookup_settings(&settings.languages).parser;
-
-        L::resolve_parse_options(overrides, language_settings, path, file_source)
+        self.effective_settings()
+            .parse_options::<L>(path, file_source)
     }
 
     pub fn analyzer_options<L>(&self, file_source: &DocumentFileSource) -> AnalyzerOptions
